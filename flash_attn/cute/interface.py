@@ -629,6 +629,16 @@ def _flash_attn_bwd(
 
     use_block_sparsity = block_sparse_tensors is not None
 
+    # SM90 block-sparse backward: tile_m=64 is the GCD between a m_block_size that fits,
+    # the base block_m of 128 from forward, and block-sparse size for subtiling.
+    if compute_capability == 9 and use_block_sparsity:
+        m_block_size = 64
+        # dQ_swapAB tuning: use False when m_block_size=64 (same as causal case)
+        dQ_swapAB = False
+
+    # Block-sparse backward uses sparse_block_size_q = 2 * tile_m.
+    bwd_subtile_factor = 2
+
     if cu_seqlens_k is None:
         assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
         assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
@@ -675,8 +685,8 @@ def _flash_attn_bwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
-    if compute_capability in [10, 11]:
-        pack_gqa = False # override for now
+    # pack_gqa backward not yet supported on anywehre
+    pack_gqa = False
     if compute_capability not in [10, 11]:
         assert deterministic is False, "bwd deterministic only supported for sm100/sm110 for now"
 
@@ -837,6 +847,14 @@ def _flash_attn_bwd(
     )
 
     # Backward kernel: compute dk, dv, dq_accum.
+    score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
+    score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
+    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod else False
+    num_aux_tensors = len(aux_tensors) if aux_tensors else 0
+    cute_aux_tensors = None
+    if aux_tensors is not None:
+        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
+
     if compute_capability == 9:
         compile_key = (
             compute_capability,
@@ -859,18 +877,14 @@ def _flash_attn_bwd(
             AtomLayoutNdKV,
             AtomLayoutMdQ,
             V_in_regs,
+            score_mod_hash,
+            score_mod_bwd_hash,
+            mask_mod_hash,
+            num_aux_tensors,
+            use_block_sparsity,
         )
         cute_aux_tensors = None
     else:
-        # Hash callables for compile key
-        score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
-        score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
-        mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod else False
-        num_aux_tensors = len(aux_tensors) if aux_tensors else 0
-        # Convert aux_tensors to cute tensors
-        cute_aux_tensors = None
-        if aux_tensors is not None:
-            cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
         compile_key = (
             compute_capability,
             dtype,
@@ -954,6 +968,9 @@ def _flash_attn_bwd(
                 AtomLayoutMdQ,
                 num_threads,
                 V_in_regs=V_in_regs,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None,
+                subtile_factor=bwd_subtile_factor,
             )
         else:
             fa_bwd_obj = FlashAttentionBackwardSm100(
@@ -970,17 +987,17 @@ def _flash_attn_bwd(
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
                 mask_mod=mask_mod,
-                has_aux_tensors=aux_tensors is not None and len(aux_tensors) > 0,
+                has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
-        # sparse_block_size_q = 2*tile_m matches forward's q_stage=2 pipelining.
+        # sparse_block_size_q = subtile_factor * tile_m matches BlockMask granularity.
         sparse_tensors_compile = None
-        if block_sparse_tensors is not None and compute_capability in [10, 11]:
+        if block_sparse_tensors is not None:
             expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
                 batch_size, num_head, seqlen_q, seqlen_k,
-                m_block_size, n_block_size, subtile_factor,
+                m_block_size, n_block_size, bwd_subtile_factor,
             )
             compile_time_normalized = normalize_block_sparse_tensors(
                 block_sparse_tensors,
@@ -1017,11 +1034,12 @@ def _flash_attn_bwd(
             sparse_tensors_compile,
             options="--enable-tvm-ffi",
         )
+    # Runtime normalization of block sparse tensors for both SM90 and SM100
     normalized_block_sparse_tensors = None
-    if block_sparse_tensors is not None and compute_capability in [10, 11]:
+    if block_sparse_tensors is not None:
         expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
             batch_size, num_head, seqlen_q, seqlen_k,
-            m_block_size, n_block_size, subtile_factor,
+            m_block_size, n_block_size, bwd_subtile_factor,
         )
         normalized_block_sparse_tensors = normalize_block_sparse_tensors(
             block_sparse_tensors,
@@ -1056,8 +1074,9 @@ def _flash_attn_bwd(
     )
 
     num_threads = 256 if compute_capability == 9 else 128
+    arch = compute_capability * 10
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
-    compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
+    compile_key_post = (dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         dq_accum_tensor = to_cute_tensor(dq_accum)
         dq_tensor = to_cute_tensor(dq)
@@ -1065,7 +1084,6 @@ def _flash_attn_bwd(
             to_cute_tensor(t, assumed_align=4) if t is not None else None
             for t in (cu_seqlens_q, seqused_q)
         ]
-        arch = compute_capability * 10
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
         )
@@ -1091,7 +1109,15 @@ def _flash_attn_bwd(
 
     if qhead_per_kvhead > 1:
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
-        compile_key_post = (dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
+        compile_key_post = (
+            dtype,
+            head_dim,
+            arch,
+            n_block_size,
+            num_threads,
+            AtomLayoutNdKV,
+            dKV_swapAB,
+        )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dk_accum_tensor = to_cute_tensor(dk_accum)
             dk_tensor = to_cute_tensor(dk)
@@ -1100,7 +1126,7 @@ def _flash_attn_bwd(
                 for t in (cu_seqlens_k, seqused_k)
             ]
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1124,6 +1150,7 @@ def _flash_attn_bwd(
         compile_key_post = (
             dtype,
             head_dim_v,
+            arch,
             n_block_size,
             num_threads,
             AtomLayoutNdKV,
@@ -1137,7 +1164,7 @@ def _flash_attn_bwd(
                 for t in (cu_seqlens_k, seqused_k)
             ]
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
